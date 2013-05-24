@@ -85,18 +85,19 @@ include("osutils.jl")
 # I/O, strings & printing
 include("io.jl")
 include("iobuffer.jl")
-include("stream.jl")
-include("socket.jl")
-include("fs.jl")
-importall .FS
-include("process.jl")
-ccall(:jl_get_uv_hooks, Void, ())
 include("char.jl")
 include("ascii.jl")
 include("utf8.jl")
 include("string.jl")
 include("regex.jl")
 include("show.jl")
+include("stream.jl")
+include("socket.jl")
+include("stat.jl")
+include("fs.jl")
+importall .FS
+include("process.jl")
+ccall(:jl_get_uv_hooks, Void, ())
 include("grisu.jl")
 import .Grisu.print_shortest
 include("printf.jl")
@@ -115,7 +116,6 @@ include("errno.jl")
 using .Errno
 include("file.jl")
 include("path.jl")
-include("stat.jl")
 
 # front end & code loading
 include("repl.jl")

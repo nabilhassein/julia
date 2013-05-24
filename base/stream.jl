@@ -18,11 +18,26 @@ abstract AsyncStream <: IO
 typealias UVHandle Ptr{Void}
 typealias UVStream AsyncStream
 
-const _sizeof_uv_pipe = int(ccall(:jl_sizeof_uv_pipe_t,Csize_t,()))
-const _sizeof_uv_poll = int(ccall(:jl_sizeof_uv_poll_t,Csize_t,()))
-const _sizeof_uv_fs_poll = int(ccall(:jl_sizeof_uv_fs_poll_t,Csize_t,()))
-const _sizeof_uv_fs_events = int(ccall(:jl_sizeof_uv_fs_events_t,Csize_t,()))
+function uv_sizeof_handle(handle) 
+    if !(UV_UNKNOWN_HANDLE < handle < UV_HANDLE_TYPE_MAX)
+        throw(DomainError())
+    end
+    ccall(:uv_handle_size,Csize_t,(Int32,),handle)
+end
 
+function uv_sizeof_req(req) 
+    if !(UV_UNKNOWN_REQ < req < UV_REQ_TYPE_MAX)
+        throw(DomainError())
+    end
+    ccall(:uv_req_size,Csize_t,(Int32,),req)
+end
+
+for h in uv_handle_types
+@eval const $(symbol("_sizeof_"*lowercase(string(h)))) = uv_sizeof_handle($h)
+end
+for r in uv_req_types
+@eval const $(symbol("_sizeof_"*lowercase(string(r)))) = uv_sizeof_handle($r)
+end
 
 function eof(s::AsyncStream)
     start_reading(s)
@@ -363,6 +378,17 @@ end
 
 abstract AsyncWork
 
+uv_handle_data(handle) = ccall(:jl_uv_handle_data,Ptr{Void},(Ptr{Void},),handle)
+
+function default_async_cb(handle,status)
+    data = uv_handle_data(handle)
+    if data != C_NULL
+        async = unsafe_pointer_to_objref(data)::SingleAsyncWork
+        async.cb(status)
+    end
+    nothing
+end
+
 type SingleAsyncWork <: AsyncWork
     cb::Function
     handle::Ptr{Void}
@@ -371,19 +397,44 @@ type SingleAsyncWork <: AsyncWork
             return new(cb,C_NULL)
         end
         this=new(cb)
-        this.handle=ccall(:jl_make_async,Ptr{Void},(Ptr{Void},Any),loop,this)
+        this.handle=c_malloc(_sizeof_uv_async)
+        err=ccall(:uv_async_init,Int32,(Ptr{Void},Ptr{Void},Ptr{Void}),loop,this.handle,
+                cfunction(default_async_cb,Void,(Ptr{Void},Int32)))
+        if err==-1
+            c_free(this.handle)
+            throw(UVError("SingleAsyncWork"))
+        end
+        associate_julia_struct(this.handle,this)
         finalizer(this,close)
         this
     end
 end
 SingleAsyncWork(cb::Function) = SingleAsyncWork(eventloop(),cb)
 
+function default_idle_cb(handle,status)
+    data = uv_handle_data(handle)
+    if data != C_NULL
+        async = unsafe_pointer_to_objref(data)::IdleAsyncWork
+        async.cb(status)
+    end
+    nothing
+end
+
 type IdleAsyncWork <: AsyncWork
     cb::Function
     handle::Ptr{Void}
     function IdleAsyncWork(loop::Ptr{Void},cb::Function)
+        if(loop == C_NULL)
+            return new(cb,C_NULL)
+        end
         this=new(cb)
-        this.handle=ccall(:jl_make_idle,Ptr{Void},(Ptr{Void},Any),loop,this)
+        this.handle=c_malloc(_sizeof_uv_idle)
+        err=ccall(:uv_idle_init,Int32,(Ptr{Void},Ptr{Void}),loop,this.handle)
+        if err==-1
+            c_free(this.handle)
+            throw(UVError("IdleAsyncWork"))
+        end
+        disassociate_julia_struct(this.handle) #Will be set by start
         finalizer(this,close)
         this
     end
@@ -394,8 +445,17 @@ type TimeoutAsyncWork <: AsyncWork
     cb::Function
     handle::Ptr{Void}
     function TimeoutAsyncWork(loop::Ptr{Void},cb::Function)
+        if(loop == C_NULL)
+            return new(cb,C_NULL)
+        end
         this=new(cb)
-        this.handle=ccall(:jl_make_timer,Ptr{Void},(Ptr{Void},Any),loop,this)
+        this.handle=c_malloc(_sizeof_uv_timer)
+        err=ccall(:uv_timer_init,Int32,(Ptr{Void},Ptr{Void}),loop,this.handle)
+        if err==-1
+            c_free(this.handle)
+            throw(UVError("TimeoutAsyncWork"))
+        end
+        disassociate_julia_struct(this.handle) #Will be set by start
         finalizer(this,close)
         this
     end
@@ -479,11 +539,21 @@ _uv_hook_close(uv::AsyncWork) = (uv.handle = 0; nothing)
 # This serves as a common callback for all async classes
 _uv_hook_asynccb(async::AsyncWork, status::Int32) = async.cb(status)
 
+function default_timer_cb(handle,status)
+    data = uv_handle_data(handle)
+    if data != C_NULL
+        async = unsafe_pointer_to_objref(data)::IdleAsyncWork
+        async.cb(status)
+    end
+    nothing
+end
 
+# units are in ms
 function start_timer(timer::TimeoutAsyncWork,timeout::Int64,repeat::Int64)
     associate_julia_struct(timer.handle,timer)
     ccall(:uv_update_time,Void,(Ptr{Void},),eventloop())
-    ccall(:jl_timer_start,Int32,(Ptr{Void},Int64,Int64),timer.handle,timeout,repeat)
+    uv_error("start_timer",ccall(:uv_timer_start,Int32,(Ptr{Void},Ptr{Void},Int64,Int64),
+        timer.handle,cfunction(default_timer_cb,Void,(Ptr{Void},Int32)),timeout,repeat)==-1)
 end
 
 function stop_timer(timer::TimeoutAsyncWork)
@@ -533,15 +603,28 @@ process_events(block::Bool) = process_events(block,eventloop())
 run_event_loop() = run_event_loop(eventloop())
 
 ##pipe functions
-malloc_pipe() = c_malloc(_sizeof_uv_pipe)
+malloc_pipe() = c_malloc(_sizeof_uv_named_pipe)
+
+const UV_PIPE_IPC          = 0x01
+const UV_PIPE_SPAWN_SAFE   = 0x02
+const UV_PIPE_READABLE     = 0x04
+const UV_PIPE_WRITEABLE    = 0x08
+
+function init_pipe(pipe,writeable::Bool,julia_only::Bool)
+    flags = writeable ? UV_PIPE_WRITEABLE : UV_PIPE_READABLE
+    if !julia_only
+        flags |= UV_PIPE_SPAWN_SAFE
+    end
+    uv_error("init_pipe",ccall(:uv_pipe_init,Int32,(Ptr{Void},Ptr{Void},Int32),eventloop(),pipe,flags)==-1)
+end
+
 function link_pipe(read_end::Ptr{Void},readable_julia_only::Bool,write_end::Ptr{Void},writeable_julia_only::Bool,pipe::AsyncStream)
     #make the pipe an unbuffered stream for now
-    ccall(:jl_init_pipe, Ptr{Void}, (Ptr{Void},Int32,Int32,Any), read_end, 0, readable_julia_only, pipe)
-    ccall(:jl_init_pipe, Ptr{Void}, (Ptr{Void},Int32,Int32,Any), write_end, 1, readable_julia_only, pipe)
-    error = ccall(:uv_pipe_link, Int32, (Ptr{Void}, Ptr{Void}), read_end, write_end)
-    if error != 0 # don't use assert here as $string isn't be defined yet
-        error("uv_pipe_link failed")
-    end
+    init_pipe(read_end,false,readable_julia_only)
+    init_pipe(write_end,true,writeable_julia_only)
+    associate_julia_struct(read_end,pipe)
+    associate_julia_struct(write_end,pipe)
+    uv_error("link_pipe",ccall(:uv_pipe_link, Int32, (Ptr{Void}, Ptr{Void}), read_end, write_end)==-1)
 end
 
 function link_pipe(read_end2::NamedPipe,readable_julia_only::Bool,write_end::Ptr{Void},writeable_julia_only::Bool)
@@ -650,26 +733,92 @@ function finish_read(state::(NamedPipe,ByteString))
     finish_read(state...)
 end
 
+const char_cache = Array(Uint8,256)
+for i=1:256
+    char_cache[i] = uint8(i-1)
+end
+
+write_length(x) = length(x)
+write_pointer(x) = pointer(x)
+write_length(::Uint8) = 1
+write_pointer(c::Uint8) = pointer(char_cache)+c
 
 ## low-level calls
 
-write(s::AsyncStream, b::ASCIIString) =
-    int(ccall(:jl_puts, Int32, (Ptr{Uint8},Ptr{Void}),b.data,handle(s)))
-write(s::AsyncStream, b::Uint8) =
-    int(ccall(:jl_putc, Int32, (Uint8, Ptr{Void}), b, handle(s)))
-write(s::AsyncStream, c::Char) =
-    int(ccall(:jl_pututf8, Int32, (Ptr{Void},Uint32), handle(s), c))
+# String are considered immutable
+write(s::AsyncStream, b::ASCIIString) = _write!(s,b.data)
+write(s::AsyncStream, b::Uint8) = _write!(s,b)
+function write(s::AsyncStream, c::Char)
+    c = int32(c)
+    if c < 0x80
+        write(s,uint8(c))
+    elseif c < 0x800
+        dest = Array(Uint8,2)
+        dest[1] = (c >> 6) | 0xC0
+        dest[2] = (c & 0x3F) | 0x80
+        _write!(s,dest)
+    elseif c < 0x10000
+        dest = Array(Uint8,3)
+        dest[1] = (c >> 12) | 0xE0;
+        dest[2] = ((c >> 6) & 0x3F) | 0x80;
+        dest[3] = (c & 0x3F) | 0x80;
+        _write!(s,dest)
+    elseif c < 0x110000
+        dest = Array(Uint8,4)
+        dest[1] = (c >> 18) | 0xF0;
+        dest[2] = ((c >> 12) & 0x3F) | 0x80;
+        dest[3] = ((c >> 6) & 0x3F) | 0x80;
+        dest[4] = (c & 0x3F) | 0x80;
+        _write!(s,dest)
+    else
+        error("Unrecognized Unicode character")
+    end
+end
 function write{T}(s::AsyncStream, a::Array{T})
     if isbits(T)
-        int(ccall(:jl_write, Uint, (Ptr{Void}, Ptr{Void}, Uint), handle(s), a, uint(length(a)*sizeof(T))))
+        _write!(s,reinterpret(Uint8,copy(a)))
     else
         invoke(write,(IO,Array),s,a)
     end
 end
-write(s::AsyncStream, p::Ptr, nb::Integer) = 
-    int(ccall(:jl_write, Uint, (Ptr{Void},Ptr{Void},Uint), handle(s), p, uint(nb)))
-_write(s::AsyncStream, p::Ptr{Void}, nb::Integer) = 
-    int(ccall(:jl_write, Uint, (Ptr{Void},Ptr{Void},Uint), handle(s), p, uint(nb)))
+function write(s::AsyncStream, p::Ptr, nb::Integer)
+    b = Array(Uint8,nb)
+    unsafe_copy!(pointer(b),p,nb)
+    _write!(s,b)
+end
+
+# 
+# Low-level write. b may not be modified after this call (until the callback is called).
+# The callback function is responsible for freeing the request.
+# This function is not intended to be exported as some care is required
+# to use it properly 
+#
+
+immutable UvBuffer
+    base::Ptr{Uint8}
+    len::Csize_t
+end
+
+function _write!(s::AsyncStream, b, cb::Function)
+    Base.sigatomic_begin()
+    req = Base.c_malloc(_sizeof_uv_write)
+    n = write_length(b)
+    buf = UvBuffer(write_pointer(b),convert(Csize_t,n))
+    # uvw->data
+    ccall(:jl_uv_req_set_data,Void,(Ptr{Void},Ptr{Void}),req,pointer_from_objref(b))
+    #unsafe_store!(convert(Ptr{Ptr{Void}},req),pointer_from_objref(b),0)
+    err = ccall(:uv_write,Int32,(Ptr{Void},Ptr{Void},Ptr{UvBuffer},Int32,Ptr{Void}),
+        req,handle(s),&buf,1,cfunction(cb,Void,(Ptr{Void},Int32)))
+    Base.sigatomic_end()
+    uv_error("_write!",err==-1)
+    n 
+end
+
+function default_write_cb(req::Ptr{Void},status::Int32)
+    c_free(req)
+end
+
+_write!(s,b) = _write!(s,b,default_write_cb)
 
 ## Libuv error handling
 _uv_lasterror(loop::Ptr{Void}) = ccall(:jl_last_errno,Int32,(Ptr{Void},),loop)
