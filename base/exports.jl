@@ -753,6 +753,7 @@ export
     prevind,
     replace,
     rpad,
+    rsearch,
     rstrip,
     search,
     split,

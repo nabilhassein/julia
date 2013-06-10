@@ -133,5 +133,5 @@ end
 
 ## misc environment-related functionality ##
 
-tty_cols() = parseint(Int32, get(ENV,"COLUMNS","80"), 10)
-tty_rows() = parseint(Int32, get(ENV,"LINES","25"), 10)
+tty_cols() = 80#parseint(Int32, get(ENV,"COLUMNS","80"), 10)
+tty_rows() = 25#parseint(Int32, get(ENV,"LINES","25"), 10)
